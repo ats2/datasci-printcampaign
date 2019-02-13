@@ -1,4 +1,19 @@
 # Databricks notebook source
+### asilcox - this needs to be usable for all offline models - not just onserts but direct mail too
+# mag_list should be in this code - if this is filtering out valid magasine codes - applies to all
+# mag_list=['AD','AL','BA','BR','CT','DE','GL','GQ','NY','SL','VF','VO','WD','WW','LK','TV','GD','GW']
+
+# see my comment below in third cell
+  # Load Mag Level Data
+### asilcox - this needs to be more generic - i.e. pass through the mag code or set of mag codes and status for each
+
+
+### asilcox Feb 3  - cell 3/line 16 added: 'mag_expiration_date'  - this must be included when expires are included - typically we include only recent (last 2 years) expires
+# ((F.col('mag_paid_status').isin('2','3','4','5')) & (F.col('mag_record_status')=='8') \
+#                 & (F.col('mag_expiration_date')>=(datetime.strptime(date,'%Y-%m-%d')-timedelta(days=(2*365))).strftime("%Y-%m-%d")))
+
+# COMMAND ----------
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from datetime import datetime,timedelta
@@ -6,61 +21,74 @@ from pyspark.sql.window import Window
 
 # COMMAND ----------
 
-def load_acxiom_data(date,ib_date,mag_codes,indiv_path,ib_path,mag_level):
+def load_acxiom_data(dates,data_paths,magazine_codes,filter_codes):
   
   # Load Individual Data
-  df_ind=spark.read.orc(indiv_path+'dt='+date) \
+  df_ind=spark.read.orc(data_paths.get('indiv')+'dt='+dates.get('date')) \
     .select(['ind_urn','age','type_of_address','country_code','address_deliverable']) \
-    .filter((F.col('address_deliverable')!='')&(F.col('address_deliverable')!='A'))  
+    .filter(~(F.col('address_deliverable').isin([' ','A'])))  
 
   # Load Infobase Data
-  df_infobase=spark.read.orc(ib_path+'dt='+ib_date) \
+### asilcox Feb 3 - this is really model specific and should be in the model specifc notebook
+  df_infobase=spark.read.orc(data_paths.get('infobase')+'dt='+dates.get('ib_date')) \
     .select(['ind_urn','ib_household_income','ib_home_market_value']) \
     .withColumn('HomeValue',F.substring(F.col('ib_home_market_value'), 1, 1))
 
   # Load Mag Level Data
-### asilcox - would prefer to make this more generic - i.e. at a min. pass through the mag code or set of mag codes
-  df_mag_level=spark.read.orc(mag_level+'dt='+date) \
-    .select(['ind_urn','mag_magazine_code','mag_paid_status','mag_record_status']) \
-    .filter((F.col('mag_magazine_code').isin(mag_codes)) & (F.col('mag_paid_status').isin('2','3','4','5','6')) & (F.col('mag_record_status')=='0'))
-
-  # Get badpay cross all titles -- NEW!!! --
-  df_badpay=spark.read.orc(mag_level+'dt='+date) \
+### asilcox 2/3/2019 - added ,'mag_expiration_date' - this will be needed to restrict expires to recent expires (typically last 2 years) in the model specific notebook
+  for idx,(k,v) in enumerate(magazine_codes.items()):
+    df=spark.read.orc(data_paths.get('Mag_level')+'dt='+dates.get('date')) \
+          .select(['ind_urn','mag_magazine_code','mag_paid_status','mag_record_status','mag_expiration_date']) \
+          .filter((F.col('mag_magazine_code').isin(k)) & (F.col('mag_paid_status').isin(v)) &\
+                  (F.col('mag_record_status').isin(filter_codes.get('mag_record_status'))))
+    if idx==0:
+      df_mag_level=df
+    else:
+      df_mag_level=df_mag_level.union(df)
+  # Get badpay cross all titles
+  df_badpay=spark.read.orc(data_paths.get('Mag_level')+'dt='+dates.get('date')) \
     .select(['ind_urn','mag_badpay_times','mag_recent_badpay_date']) \
-    .groupBy('ind_urn').agg(F.sum('mag_badpay_times').alias('mag_badpay_times'),F.max('mag_recent_badpay_date').alias('mag_recent_badpay_date'))
+    .groupBy('ind_urn').agg(F.sum('mag_badpay_times').alias('mag_badpay_times'),F.max('mag_recent_badpay_date').\
+                            alias('mag_recent_badpay_date'))
   
   # Merge tables
   df_ind_mag_info=df_mag_level.join(df_ind,'ind_urn') \
-    .join(df_badpay,'ind_urn').filter(~(F.col('mag_badpay_times')>2) & (~(F.col('mag_recent_badpay_date')>=(datetime.strptime(date,'%Y-%m-%d')-timedelta(days=365)).strftime("%Y-%m-%d")))) \
+    .join(df_badpay,'ind_urn').filter(~(F.col('mag_badpay_times')>2) & (~(F.col('mag_recent_badpay_date')>=(datetime.strptime(dates.get('date'),'%Y-%m-%d')-timedelta(days=365)).strftime("%Y-%m-%d")))) \
     .join(df_infobase,'ind_urn','left_outer')
 
   return df_ind_mag_info
 
 # COMMAND ----------
 
-### asilcox - the splits will depend on the sample size - not always 20% - this should be a random selection train/test
-
 #Collect matched CRM users and negative samples from active subscribers
+# def load_negative_samples(matched_crm,Active_Subscriber):
+#   final_users=matched_crm.join(Active_Subscriber,Active_Subscriber.ind_urn==matched_crm.IND_URN,'right_outer').\
+#                     drop(matched_crm.IND_URN).withColumn('splits',(F.col('ind_urn')%10)).filter((F.col('splits')=='2') |\
+#                     (F.col('splits')=='7')|(F.col('nrsp')==1)).withColumn('nrsp',F.when(F.col('nrsp')=='1',1).otherwise(0)).\
+#                     select('ind_urn','nrsp')
+#   return final_users
+
+# temp to match SAS output
 def load_negative_samples(matched_crm,Active_Subscriber):
   final_users=matched_crm.join(Active_Subscriber,Active_Subscriber.ind_urn==matched_crm.IND_URN,'right_outer').\
-                    drop(matched_crm.IND_URN).withColumn('splits',(F.col('ind_urn')%10)).filter((F.col('splits')=='2') |\
-                    (F.col('splits')=='7')|(F.col('nrsp')==1)).withColumn('nrsp',F.when(F.col('nrsp')=='1',1).otherwise(0)).\
+                    drop(matched_crm.IND_URN).withColumn('splits',(F.col('ind_urn')%100)).filter((F.col('splits')=='28') |\
+                    (F.col('splits')=='73')|(F.col('nrsp')==1)).withColumn('nrsp',F.when(F.col('nrsp')=='1',1).otherwise(0)).\
                     select('ind_urn','nrsp')
   return final_users
 
 # COMMAND ----------
 
-def create_individual_order_data(final_users,indiv_variables,ord_variables,Ib_vars,date,info_date,cat_cols,indiv_path,ib_path,mag_ord_level):
-  ind_df=spark.read.orc(indiv_path+'dt='+date).select(indiv_variables).\
-                      filter((F.col('address_deliverable')!='')&(F.col('address_deliverable')!='A'))
-  info_df=spark.read.orc(ib_path+'dt='+info_date).select(Ib_vars).\
+def create_individual_order_data(final_users,indiv_variables,ord_variables,Ib_vars,dates,cat_cols,data_paths):
+  ind_df=spark.read.orc(data_paths.get('indiv')+'dt='+dates.get('date')).select(indiv_variables)\
+                      .filter(~(F.col('address_deliverable').isin([' ','A'])))  
+  info_df=spark.read.orc(data_paths.get('infobase')+'dt='+dates.get('ib_date')).select(Ib_vars).\
           withColumn('Married',F.when(F.col('ib_marital_status').isin('A','M'),F.lit(1)).otherwise(0))
   for i in cat_cols: 
     info_df=info_df.withColumn(i,F.when(F.substring(F.col(i),1,1)=='Y',F.lit(1)).otherwise(0))
   
-  df_mag_ord=spark.read.orc(mag_ord_level+'dt='+date).select(ord_variables).\
-                            filter(F.col('order_record_status')!=5)
-  individual_data=ind_df.join(info_df,'ind_urn')
+  df_mag_ord=spark.read.orc(data_paths.get('Mag_Ord_level')+'dt='+dates.get('date')).select(ord_variables).\
+                            filter(~(F.col('order_record_status')==5))
+  individual_data=ind_df.join(info_df,'ind_urn',how='full')
   Indiv_data=final_users.join(individual_data,['ind_urn'],'left_outer')
   Order_data=final_users.join(df_mag_ord,['ind_urn'],'left_outer').orderBy('ind_urn','order_magazine_code','order_date').drop('nrsp')
   return Order_data,Indiv_data
@@ -75,31 +103,39 @@ def create_individual_vars(Indiv_data):
                     withColumn('College',F.when(F.substring(F.col('ib_education_1st_Ind_100'),1,1)==2,F.lit(1)).otherwise(0)).\
                     withColumn('GradSchool',F.when(F.substring(F.col('ib_education_1st_Ind_100'),1,1)==3,F.lit(1)).otherwise(0)).\
                     withColumn('hispanic',F.when(F.col('IB_ETHNIC_CODE')==20,F.lit(1)).otherwise(0)).\
-                    withColumn('black',F.when(F.substring('IB_ETHNIC_CODE',1,1).isin('8','9','A','D','E','F','I','S','U','W'),F.lit(1)).\
-                    when(F.col('IB_ETHNIC_CODE').isin('UC','8D','8E','8G','8H','9F','9J','9K','9L','9M','9N','9P','9Q','9S','9U','9V','9X'),\
-                    F.lit(0)).otherwise(0)).withColumn('homevalue',F.when(F.col('ib_home_market_value').isin('A','B','C','D'),1).\
-                    when(F.col('ib_home_market_value').isin('E','F','G','H'),2).\
-                    when(F.col('ib_home_market_value').isin('I','J','K','L'),3).when(F.col('ib_home_market_value').isin('M','N'),4).\
-                    when(F.col('ib_home_market_value').isin('O','P'),5).when(F.col('ib_home_market_value').isin('Q'),6).\
-                    when(F.col('ib_home_market_value').isin('R'),7).when(F.col('ib_home_market_value').isin('S'),8).otherwise(None))
+                    withColumn('black',F.when(F.substring('IB_ETHNIC_CODE',1,1).isin(['8','9','A','D','E','F','I','S','U','W']),F.lit(1)).\
+                      when(F.col('IB_ETHNIC_CODE').\
+                           isin(['UC','8D','8E','8G','8H','9F','9J','9K','9L','9M','9N','9P','9Q','9S','9U','9V','9X']),\
+                      F.lit(0)).otherwise(0)).withColumn('homevalue',F.when(F.col('ib_home_market_value').isin(['A','B','C','D']),1).\
+                    when(F.col('ib_home_market_value').isin(['E','F','G','H']),2).\
+                    when(F.col('ib_home_market_value').isin(['I','J','K','L']),3).when(F.col('ib_home_market_value').isin(['M','N']),4).\
+                    when(F.col('ib_home_market_value').isin(['O','P']),5).when(F.col('ib_home_market_value').isin(['Q']),6).\
+                    when(F.col('ib_home_market_value').isin(['R']),7).when(F.col('ib_home_market_value').isin(['S']),8).otherwise(None))
   return Ind_Data
 
 # COMMAND ----------
 
-def create_order_variables(Order_data,mag_list,End_date):
+def create_order_variables(Order_data,mag_list,dates):
   #End_date=Order_data.agg({'order_date':'max'}).collect()[0][0]
-  End_date=datetime.strptime(End_date, '%Y-%m-%d')
+  End_date=datetime.strptime(dates.get('end_date'), '%Y-%m-%d')
   for cd in mag_list:
-    Order_data=Order_data.withColumn('Active'+cd,F.when((F.col('order_magazine_code')==cd)&(F.col('order_expire_date')>=(End_date).\
-                              strftime("%Y-%m-%d"))&(F.col('order_paid_status').isin('2','3','4','5')),1).\
-                              when((F.col('order_magazine_code')==cd)&(F.col('order_expire_date')>=(End_date).\
-                              strftime("%Y-%m-%d"))&(F.col('order_paid_status').isin('6'))&\
+    Order_data=Order_data.withColumn('Active'+cd, F.when(F.col('order_magazine_code')==cd,F.when((F.col('order_expire_date')>=(End_date).\
+                              strftime("%Y-%m-%d"))&(F.col('order_paid_status').isin(['2','3','4','5'])),1).\
+                              when((F.col('order_expire_date')>=(End_date).strftime("%Y-%m-%d"))&(F.col('order_paid_status').isin(['6']))&\
                               (F.col('order_start_date')>=(End_date-timedelta(days=91.5)).strftime("%Y-%m-%d")),2).\
-                              when((F.col('order_magazine_code')==cd)&(F.col('order_expire_date')<(End_date).\
-                              strftime("%Y-%m-%d")),3).otherwise(0))
-  windowspec=Window.partitionBy(Order_data.ind_urn).orderBy(Order_data.ind_urn)
-  Order_data = Order_data.withColumn("rn", F.row_number().over(windowspec)).withColumn("max",\
-                         F.max('rn').over(windowspec)).filter(F.col('max')==F.col('rn')).drop('max','rn')
+                              when((F.col('order_expire_date')<(End_date).strftime("%Y-%m-%d")),3)).otherwise(0))
+    
+  
+  Order_data=Order_data.withColumn('TDTPO',F.lit(0)).withColumn('TDTPO',F.when(((F.substring(F.col('order_document_key'),1,1)).\
+                                                   isin(['D','G','J','K','R','W','X'])),F.col('TDTPO')+1).otherwise(0))
+  windowspec=Window.partitionBy(Order_data.ind_urn,Order_data.order_magazine_code).orderBy(Order_data.ind_urn)
+  Order_data = Order_data.withColumn('TDTPO',F.sum('TDTPO').over(windowspec)).withColumn("rn", F.row_number().over(windowspec)).\
+  withColumn("max",F.max('rn').over(windowspec)).filter(F.col('max')==F.col('rn'))
+  Activecols=['Active'+br for br in mag_list]
+  exprs = [F.max(F.col(c)).alias(c) for c in Activecols]
+  Order_data=Order_data.groupby('ind_urn').agg(*exprs,F.sum(F.col('TDTPO')).alias('TDTPO'))
+  
+  
   #Ever Active subscribers variables based on active indicator code
   Order_data=Order_data.withColumn('EVERSUBSR',sum([F.when(F.col('ACTIVEAL')!=0,1).otherwise(0),F.when(F.col('ACTIVEBR')!=0,1).otherwise(0),\
                                            F.when(F.col('ACTIVESL')!=0,1).otherwise(0),F.when(F.col('ACTIVEVO')!=0,1).otherwise(0),\
@@ -137,36 +173,41 @@ def create_order_variables(Order_data,mag_list,End_date):
 #Merging order and individual data
 def create_universal_data_vars(Ind_data,Ord_data,uni_drop):
   universal_data=Ind_data.join(Ord_data,'ind_urn','left_outer')
-  universal_data=universal_data.withColumn('ActiveLKGL',F.when(((F.col('ACTIVEGL').isin(1,2))&(F.col('ACTIVELK').isin(1,2))),2).\
-                                   when(((F.col('ACTIVEGL').isin(1,2))|(F.col('ACTIVELK').isin(1,2))),1).otherwise(0)).\
+  universal_data=universal_data.withColumn('ActiveLKGL',F.when(((F.col('ACTIVEGL').isin([1,2]))&(F.col('ACTIVELK').isin([1,2]))),2).\
+                                   when(((F.col('ACTIVEGL').isin([1,2]))|(F.col('ACTIVELK').isin([1,2]))),1).otherwise(0)).\
                         withColumn('Male',F.when(F.col('Gender')=='M',1).otherwise(0)).\
                         withColumn('HealthyFash',sum([F.col('ib_fashion'),F.col('ib_reading_mags'),F.col('ib_health_medical_gen'),\
-                                              F.col('ib_dieting_weight_loss'),F.col('ib_natural_foods'),F.col('ib_exercise_health')])).\
-                        withColumn('pacific',F.when(F.col('state').isin('AK','HI','WA','OR','CA'),1).otherwise(0)).\
-                        withColumn('mountain',F.when(F.col('state').isin('MT','ID','WY','CO','UT','NV','AZ','NM'),1).otherwise(0)).\
-                        withColumn('MidWest',F.when(F.col('state').isin('ND','SD','NE','KS','MN','IA','MO','WI','MI','IL','IN','OH'),1).\
+                                              F.col('ib_dieting_weight_loss'),F.col('ib_natural_foods'),F.col('ib_exercise_health'),\
+                                                      F.col('ib_home_furnishings'),F.col('ib_cooking_gourmet')])).\
+                        withColumn('pacific',F.when(F.col('state').isin(['AK','HI','WA','OR','CA']),1).otherwise(0)).\
+                        withColumn('mountain',F.when(F.col('state').isin(['MT','ID','WY','CO','UT','NV','AZ','NM']),1).otherwise(0)).\
+                        withColumn('MidWest',F.when(F.col('state').isin(['ND','SD','NE','KS','MN','IA','MO','WI','MI','IL','IN','OH']),1).\
                                    otherwise(0)).\
-                        withColumn('WSCentral',F.when(F.col('state').isin('OK','AR','LA','TX'),1).otherwise(0)).\
-                        withColumn('ESCentral',F.when(F.col('state').isin('KY','TN','MS','AL'),1).otherwise(0)).\
-                        withColumn('MidAtlantic',F.when(F.col('state').isin('NY','PA','NJ'),1).otherwise(0)).\
-                        withColumn('SouthAtlantic',F.when(F.col('state').isin('WV','MD','DC','DE','VA','NC','SC','GA','FL'),1).\
+                        withColumn('WSCentral',F.when(F.col('state').isin(['OK','AR','LA','TX']),1).otherwise(0)).\
+                        withColumn('ESCentral',F.when(F.col('state').isin(['KY','TN','MS','AL']),1).otherwise(0)).\
+                        withColumn('MidAtlantic',F.when(F.col('state').isin(['NY','PA','NJ']),1).otherwise(0)).\
+                        withColumn('SouthAtlantic',F.when(F.col('state').isin(['WV','MD','DC','DE','VA','NC','SC','GA','FL']),1).\
                                    otherwise(0)).\
-                        withColumn('MidAtlantic',F.when(F.col('state').isin('ME','VT','NH','MA','CT','RI'),1).otherwise(0)).\
-                        withColumn('ac_nielsen_county_size_code',F.when(F.col('state').isin('A'),1).otherwise(0)).\
-                        withColumn('ac_nielsen_county_size_code',F.when(F.col('state').isin('B'),1).otherwise(0)).\
-                        withColumn('ac_nielsen_county_size_code',F.when(F.col('state').isin('C'),1).otherwise(0)).\
-                        withColumn('ac_nielsen_county_size_code',F.when(F.col('state').isin('D'),1).otherwise(0)).\
-                        drop(*uni_drop)
+                        withColumn('NewEngland',F.when(F.col('state').isin(['ME','VT','NH','MA','CT','RI']),1).otherwise(0)).\
+                        withColumn('NielsenA',F.when(F.col('ac_nielsen_county_size_code')=='A',1).otherwise(0)).\
+                        withColumn('NielsenB',F.when(F.col('ac_nielsen_county_size_code')=='B',1).otherwise(0)).\
+                        withColumn('NielsenC',F.when(F.col('ac_nielsen_county_size_code')=='C',1).otherwise(0)).\
+                        withColumn('NielsenD',F.when(F.col('ac_nielsen_county_size_code')=='D',1).otherwise(0))
+#   .\
+#                         drop(*uni_drop)
   return universal_data
 
 # COMMAND ----------
 
 #Create total paid order variables for DTP and Non DTPorder orders to all brand 
-def create_paid_dtp_non_dtp_ordvars(ind_date,mag_list,End_date,ord_variables,dic,mag_ord_level):
+def create_paid_dtp_non_dtp_ordvars(dates,mag_list,ord_variables,dic,data_paths,paid_ord_vars):
   #Create empty variables values with 0
-  End_date=datetime.strptime(End_date, '%Y-%m-%d')
-  mag_ord_data=spark.read.orc(mag_ord_level+'dt='+ind_date).select(ord_variables).\
-                            filter(F.col('order_record_status')!=5).orderBy('ind_urn','order_magazine_code','order_date')
+  End_date=datetime.strptime(dates.get('end_date'), '%Y-%m-%d')
+### asilcox 2/20/2019 do not exclude order_record_status 5
+#   mag_ord_data=spark.read.orc(data_paths.get('Mag_Ord_level')+'dt='+dates.get('date')).select(ord_variables).\
+#                             filter(F.col('order_record_status')!=5).orderBy('ind_urn','order_magazine_code','order_date')
+  mag_ord_data=spark.read.orc(data_paths.get('Mag_Ord_level')+'dt='+dates.get('date')).select(ord_variables).\
+                            orderBy('ind_urn','order_magazine_code','order_date')
   for d in mag_list:
      mag_ord_data=mag_ord_data.withColumn('totord_'+d,F.lit(0)).withColumn('pdtotord_'+d,F.lit(0)).withColumn('pdtotord_3yrs_'+d,F.lit(0)).\
                        withColumn('proppd_'+d,F.lit(0)).withColumn('pdord_12_'+d,F.lit(0)).withColumn('pddtp_'+d,F.lit(0)).\
@@ -178,36 +219,46 @@ def create_paid_dtp_non_dtp_ordvars(ind_date,mag_list,End_date,ord_variables,dic
                        orderBy('ind_urn','order_magazine_code','order_date')
   for j in mag_list:
     mag_ord_data=mag_ord_data.withColumn('totord_'+j,F.when(F.col('order_magazine_code')==j,F.col('totord_'+j)+1).otherwise(0)).\
-    withColumn('pdtotord_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))),\
+    withColumn('pdtotord_'+j,F.when(((F.col('order_magazine_code')==j)&\
+                                     (F.col('order_paid_status').isin(['2','3','4','5']))),
                                 F.col('pdtotord_'+j)+1).otherwise(0)).\
-    withColumn('pdtotord_3yrs_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
+    withColumn('pdtotord_3yrs_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                             isin(['2','3','4','5']))&\
                                           (F.col('order_date')>=(End_date-timedelta(days=36*30.44)).strftime("%Y-%m-%d"))),\
                                            F.col('pdtotord_3yrs_'+j)+1).otherwise(0)).\
-    withColumn('pdord_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
+    withColumn('pdord_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                        isin(['2','3','4','5']))&\
                                   (F.col('order_date')>=(End_date-timedelta(days=12*30.44)).strftime("%Y-%m-%d"))),\
                                    F.col('pdord_12_'+j)+1).otherwise(0)).\
-    withColumn('proppd_'+j,F.when(F.col('order_magazine_code')==j,F.col('pdtotord_'+j)/F.col('totord_'+j))).\
-    withColumn('pddtp_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
-                                  ((F.substring(F.col('order_document_key'),1,1)).isin('R','''#''','A','D','C','X','G','U','W','J','K'))),\
+    withColumn('pddtp_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                     isin(['2','3','4','5']))&\
+                                  ((F.substring(F.col('order_document_key'),1,1)).isin(['R','''#''','A','D','C','X','G','U','W','J','K']))),\
                                   F.col('pddtp_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
-                                  ((F.substring(F.col('order_document_key'),1,1)).isin('R','''#''','A','D','C','X','G','U','W','J','K'))&\
+    withColumn('pddtp_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                        isin(['2','3','4','5']))&\
+                                  ((F.substring(F.col('order_document_key'),1,1)).isin(['R','''#''','A','D','C','X','G','U','W','J','K']))&\
                                    (F.col('order_date')>=(End_date-timedelta(days=12*30.44)).strftime("%Y-%m-%d"))),\
                                     F.col('pddtp_12_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_3yrs_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
-                                     ((F.substring(F.col('order_document_key'),1,1)).isin('R','''#''','A','D','C','X','G','U','W','J','K'))&\
+    withColumn('pddtp_3yrs_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                          isin(['2','3','4','5']))&\
+                                     ((F.substring(F.col('order_document_key'),1,1)).\
+                                      isin(['R','''#''','A','D','C','X','G','U','W','J','K']))&\
                                       (F.col('order_date')>=(End_date-timedelta(days=36*30.44)).strftime("%Y-%m-%d"))),\
                                        F.col('pddtp_3yrs_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_ren_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
-                                      (F.substring(F.col('order_document_key'),1,1).isin('R','A','''#'''))),\
+    withColumn('pddtp_ren_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                         isin(['2','3','4','5']))&\
+                                      (F.substring(F.col('order_document_key'),1,1).isin(['R','A','''#''']))),\
                                        F.col('pddtp_ren_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_ins_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
-                                     (F.substring(F.col('order_document_key'),1,1).isin('J','K'))),\
+    withColumn('pddtp_ins_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                         isin(['2','3','4','5']))&\
+                                     (F.substring(F.col('order_document_key'),1,1).isin(['J','K']))),\
                                       F.col('pddtp_ins_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_dm_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
+    withColumn('pddtp_dm_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                        isin(['2','3','4','5']))&\
                                      (F.substring(F.col('order_document_key'),1,1).isin('D'))),\
                                       F.col('pddtp_dm_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_auto_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').isin('2','3','4','5'))&\
+    withColumn('pddtp_auto_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_paid_status').\
+                                                                          isin(['2','3','4','5']))&\
                                        (F.substring(F.col('order_document_key'),1,1).isin('''#'''))),\
                                         F.col('pddtp_auto_'+j)+1).otherwise(0)).\
     withColumn('pddtp_auto_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).isin('''#'''))&\
@@ -218,27 +269,40 @@ def create_paid_dtp_non_dtp_ordvars(ind_date,mag_list,End_date,ord_variables,dic
                                              F.col('pddtp_auto_3yrs_'+j)+1).otherwise(0)).\
     withColumn('pddtp_ren_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).\
                                           isin('R','A','''#'''))&(F.col('order_date')>=(End_date-timedelta(days=12*30.44)).\
-                                          strftime("%Y-%m-%d"))),F.col('pddtp_auto_12_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_ins_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).isin('J','K'))&\
+                                          strftime("%Y-%m-%d"))),F.col('pddtp_ren_12_'+j)+1).otherwise(0)).\
+    withColumn('pddtp_ins_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).isin(['J','K']))&\
                                          (F.col('order_date')>=(End_date-timedelta(days=12*30.44)).strftime("%Y-%m-%d"))),\
                                           F.col('pddtp_ins_12_'+j)+1).otherwise(0)).\
-    withColumn('pddtp_dm_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).isin('D'))&\
+    withColumn('pddtp_dm_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).isin(['D']))&\
                                         (F.col('order_date')>=(End_date-timedelta(days=12*30.44)).strftime("%Y-%m-%d"))),\
                                          F.col('pddtp_dm_12_'+j)+1).otherwise(0)).\
     withColumn('pddtp_int_12_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).\
-                                          isin('I','7','8','9'))&(F.col('order_paid_status').isin('2','3','4','5'))&(F.col('order_date')>=\
+                                          isin(['I','7','8','9']))&(F.col('order_paid_status').\
+                                                                    isin(['2','3','4','5']))&(F.col('order_date')>=\
                                          (End_date-timedelta(days=12*30.44)))),F.col('pddtp_int_12_'+j)+1).otherwise(0)).\
     withColumn('pddtp_int_'+j,F.when(((F.col('order_magazine_code')==j)&(F.substring(F.col('order_document_key'),1,1).\
-                                       isin('I','7','8','9'))&(F.col('order_paid_status').\
-                                       isin('2','3','4','5'))),F.col('pddtp_int_'+j)+1).otherwise(0)).\
-                orderBy('ind_urn','order_magazine_code','order_date')
+                                       isin(['I','7','8','9']))&(F.col('order_paid_status').\
+                                       isin(['2','3','4','5']))),F.col('pddtp_int_'+j)+1).otherwise(0)).\
+    withColumn('mslstord_'+j,F.when(((F.col('order_magazine_code')==j)&(F.col('order_date')==End_date)),1/30.4).\
+                               when(((F.col('order_magazine_code')==j)&(End_date>F.col('order_date'))),((F.datediff(F.lit(End_date.date()),\
+                               F.col('order_date')))-1)/30.4).otherwise(240)).orderBy('ind_urn','order_magazine_code','order_date')
     
-  windowspec=Window.partitionBy(mag_ord_data.ind_urn).orderBy(mag_ord_data.ind_urn)
-  mag_ord_data = mag_ord_data.withColumn("rn", F.row_number().over(windowspec)).withColumn("max",\
-                         F.max('rn').over(windowspec)).filter(F.col('max')==F.col('rn')).drop('max','rn') 
+  cols=[i+j for i in paid_ord_vars for j in mag_list]
+  exprs = [F.sum(F.col(c)).alias(c) for c in cols]
+  mslsord=['mslstord_'+br for br in mag_list]
+  exprs1= [F.min(F.col(c)).alias(c) for c in mslsord]  
+  mag_ord_data=mag_ord_data.groupby('ind_urn').agg(*exprs,*exprs1)
+  mag_ord_data=mag_ord_data.withColumn('mslstord',F.least(F.col(mslsord[0]),F.col(mslsord[1]),F.col(mslsord[2]),F.col(mslsord[3]),\
+                                                          F.col(mslsord[4]),F.col(mslsord[5]),F.col(mslsord[6]),F.col(mslsord[7]),\
+                                                          F.col(mslsord[8]),F.col(mslsord[9]),F.col(mslsord[10]),F.col(mslsord[11]),\
+                                                          F.col(mslsord[12]),F.col(mslsord[13]),F.col(mslsord[14]),F.col(mslsord[15]),\
+                                                          F.col(mslsord[16]),F.col(mslsord[17])))
+
   #Variables for non DTP order
   for k in mag_list:
-    mag_ord_data=mag_ord_data.withColumn('pdnondtp_'+k,(F.col('pdtotord_'+k)-F.col('pddtp_'+k))).\
+    mag_ord_data=mag_ord_data.withColumn('proppd_'+k,F.when((F.col('pdtotord_'+k)!=0)&(F.col('totord_'+k)!=0),\
+                                                            F.col('pdtotord_'+k)/F.col('totord_'+k)).otherwise(0)).\
+                           withColumn('pdnondtp_'+k,(F.col('pdtotord_'+k)-F.col('pddtp_'+k))).\
                            withColumn('pdnondtp_12_'+k,(F.col('pdord_12_'+k)-F.col('pddtp_12_'+k))).\
                            withColumn('pdnondtp_3yrs_'+k,(F.col('pdtotord_3yrs_'+k)-F.col('pddtp_3yrs_'+k)))
   
@@ -247,8 +311,7 @@ def create_paid_dtp_non_dtp_ordvars(ind_date,mag_list,End_date,ord_variables,dic
     mag_ord_data=mag_ord_data.withColumn(key,(F.col(value[0])+F.col(value[1])+F.col(value[2])+F.col(value[3])+F.col(value[4])+\
                                             F.col(value[5])+F.col(value[6])+F.col(value[7])+F.col(value[8])+F.col(value[9])+\
                                             F.col(value[10])+F.col(value[11])+F.col(value[12])+F.col(value[13])+F.col(value[14])+\
-                                            F.col(value[15])+F.col(value[16])+F.col(value[17])))
-    
+                                            F.col(value[15])+F.col(value[16])+F.col(value[17])))    
   return mag_ord_data
 
 # COMMAND ----------
@@ -275,7 +338,6 @@ def declare_required_variables():
     BLOCK
     COUNTRY_CODE
     CUSTOMER_TYPE
-    EMAIL_PRESENCE_FLAG
     FIPS_COUNTY_CODE
     GENDER
     HH_urn
@@ -723,13 +785,7 @@ def declare_required_variables():
     ib_fashion'''  
   cat_cols=cat_cols.split('\n')
   cat_cols=[x.strip('   ') for x in cat_cols]
-  uni_drop='''order_magazine_code
-    order_paid_status
-    order_expire_date
-    order_record_status
-    order_document_key
-    order_start_date
-    ACTIVEAD
+  uni_drop='''ACTIVEAD
     ACTIVEAL
     ACTIVEBA
     ACTIVEBR
@@ -749,7 +805,25 @@ def declare_required_variables():
     ACTIVEGW'''
   uni_drop=uni_drop.split('\n')
   uni_drop=[x.strip('   ') for x in uni_drop]
-  return ord_variables,indiv_variables,Ib_vars,cat_cols,uni_drop
+  paid_ord_vars=['totord_',
+  'pdtotord_',
+  'pdtotord_3yrs_',
+  'pdord_12_',
+  'pddtp_',
+  'pddtp_dm_',
+  'pddtp_ren_',
+  'pddtp_auto_',
+  'pddtp_ins_',
+  'pddtp_int_',
+  'pddtp_12_',
+  'pddtp_3yrs_',
+  'pddtp_dm_12_',
+  'pddtp_ren_12_',
+  'pddtp_auto_12_',
+  'pddtp_auto_3yrs_',
+  'pddtp_ins_12_',
+  'pddtp_int_12_']
+  return ord_variables,indiv_variables,Ib_vars,cat_cols,uni_drop,paid_ord_vars
 
 # COMMAND ----------
 
@@ -776,7 +850,7 @@ def total_order_variables():
   pdnondtp_3yrs_'''
   newvar=newvar.split(sep='\n')
   newvar=[x.strip('   ') for x in newvar]
-  magcd=['AD','AL','BA','BR','CT','DE','GL','GQ','NY','SL','VF','VO','WD','WW','LK','TV','GD','GW']
+  magcd=['AD','AL','BA','BR','CT','GQ','NY','VF','VO','WD','WW','TV','GD','DE','GL','SL','LK','GW']
   dic={}
   for l in newvar:
     l1=[]
@@ -825,7 +899,7 @@ def total_order_variables():
   totalpdnondtpord_3yrs'''
   newkey=newkey.split(sep='\n')
   newkey=[x.strip('   ') for x in newkey]
-  for d in range(0,18):
+  for d in range(0,19):
     dic[newkey[d]]=dic[oldkey[d]]
     del dic[oldkey[d]]
   return dic
@@ -833,29 +907,33 @@ def total_order_variables():
 # COMMAND ----------
 
 #Common data preperation function 
-def create_model_training_data(final_users):
-  date='2019-01-19'
-  EndDate='2019-01-18'
-  infobase_date='2019-01-19'
-  indiv_path='s3://cn-consumerintelligence/People/asilcox/acxiom/orc/individual/'
-  ib_path='s3://cn-consumerintelligence/People/asilcox/acxiom/orc/infobase/'
-  mag_level='s3://cn-consumerintelligence/People/asilcox/acxiom/orc/mag_level/'
-  mag_ord_level='s3://cn-consumerintelligence/People/asilcox/acxiom/orc/mag_order_level/'
-  mag_list=['AD','AL','BA','BR','CT','DE','GL','GQ','NY','SL','VF','VO','WD','WW','LK','TV','GD','GW']
+def create_model_training_data(final_users,dates,data_paths):
+  mag_list=['AD','AL','BA','BR','CT','GQ','NY','VF','VO','WD','WW','TV','GD','DE','GL','SL','LK','GW']
   #Variables declaration 
-  ord_variables,indiv_variables,Ib_vars,cat_cols,uni_drop=declare_required_variables()
+  ord_variables,indiv_variables,Ib_vars,cat_cols,uni_drop,paid_ord_vars=declare_required_variables()
   total_ord_vars_dic=total_order_variables()
   #Extract order and individual data for final matched users -infobaseActives.sas,AttachIndivOrder.sas
-  Order_data,Indiv_data =create_individual_order_data(final_users,indiv_variables,ord_variables,Ib_vars,date,\
-                                                           infobase_date,cat_cols,indiv_path,ib_path,mag_ord_level)
+  Order_data,Indiv_data =create_individual_order_data(final_users,indiv_variables,ord_variables,Ib_vars,dates,cat_cols,\
+                                                      data_paths)
   #Creating new individual variables- infobaseActives.sas
   Indiv_data=create_individual_vars(Indiv_data)
   #Creating new order variables - CreateOrderVar.sas
-  Order_data=create_order_variables(Order_data,mag_list,EndDate)
+  Order_data_test=create_order_variables(Order_data,mag_list,dates)
   #create universal data by combining individual and order data - InfobaseActives.sas
-  univ1=create_universal_data_vars(Indiv_data,Order_data,uni_drop)
+  univ1=create_universal_data_vars(Indiv_data,Order_data_test,uni_drop)
   #create total paid dtp and non dtp order variables - CreateOrderVar.sas 
-  ord_summary=create_paid_dtp_non_dtp_ordvars(date,mag_list,EndDate,ord_variables,total_ord_vars_dic,mag_ord_level)
+  ord_summary=create_paid_dtp_non_dtp_ordvars(dates,mag_list,ord_variables,total_ord_vars_dic,data_paths,paid_ord_vars)
   training_data=Merge_census_data(univ1,ord_summary)
+  #Deleting Columns for the following brands DE, GL, SL, LK, GW
+  rmve_brands=['_DE','_GL','_SL','_LK','_GW']
+  del_vars=[i for i in training_data.columns for j in rmve_brands if i.endswith(j)]
+  training_data=training_data.drop(*del_vars)
   
   return training_data
+
+# COMMAND ----------
+
+# dbutils.fs.ls('s3://cn-consumerintelligence/People/asilcox/acxiom/orc/')
+
+# COMMAND ----------
+
